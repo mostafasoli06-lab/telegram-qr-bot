@@ -11,6 +11,8 @@ const PORT = process.env.PORT || 8080;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const DB_PATH = path.join(process.cwd(), "numbers.json");
 
+const albumBuffer = new Map();
+
 function loadDB() {
   if (!fs.existsSync(DB_PATH)) return [];
   try {
@@ -47,6 +49,17 @@ async function sendMessage(chatId, text) {
   await telegram("sendMessage", { chat_id: chatId, text });
 }
 
+async function sendDocument(chatId, filePath, caption = "") {
+  const FormData = (await import("form-data")).default;
+  const form = new FormData();
+  form.append("chat_id", chatId);
+  form.append("caption", caption);
+  form.append("document", fs.createReadStream(filePath));
+  await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`, form, {
+    headers: form.getHeaders()
+  });
+}
+
 async function getFileUrl(fileId) {
   const res = await axios.get(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`);
   const filePath = res.data.result.file_path;
@@ -55,7 +68,7 @@ async function getFileUrl(fileId) {
 
 async function ocrImageFromUrl(imageUrl) {
   const img = await axios.get(imageUrl, { responseType: "arraybuffer" });
-  const tempPath = path.join(process.cwd(), `temp_${Date.now()}.jpg`);
+  const tempPath = path.join(process.cwd(), `temp_${Date.now()}_${Math.random().toString(16).slice(2)}.jpg`);
   fs.writeFileSync(tempPath, img.data);
 
   const worker = await createWorker("eng");
@@ -64,6 +77,70 @@ async function ocrImageFromUrl(imageUrl) {
 
   fs.unlinkSync(tempPath);
   return result.data.text;
+}
+
+async function handleFileIds(chatId, fileIds) {
+  const oldNumbers = loadDB();
+  const oldSet = new Set(oldNumbers);
+  const batchSeen = new Set();
+
+  const normalRows = [];
+  const duplicateRows = [];
+
+  for (const fileId of fileIds) {
+    try {
+      const fileUrl = await getFileUrl(fileId);
+      const text = await ocrImageFromUrl(fileUrl);
+      const number = extractNumber(text);
+
+      if (!number) continue;
+
+      const isDuplicate = oldSet.has(number) || batchSeen.has(number);
+      batchSeen.add(number);
+
+      if (isDuplicate) {
+        duplicateRows.push({ number, status: "مكرر" });
+      } else {
+        normalRows.push({ number, status: "" });
+      }
+    } catch (err) {
+      console.error("IMAGE ERROR:", err?.response?.data || err.message || err);
+    }
+  }
+
+  const finalRows = [...normalRows, ...duplicateRows];
+
+  if (!finalRows.length) {
+    await sendMessage(chatId, "مش قادر أقرأ أرقام من الصور. جرّب صور أوضح.");
+    return;
+  }
+
+  const allNumbersToSave = [...oldNumbers, ...finalRows.map(r => r.number)];
+  saveDB(allNumbersToSave);
+
+  let reply = finalRows.map(r => r.status ? `${r.number} - ${r.status}` : r.number).join("\n");
+  reply += `\n\nالإجمالي: ${finalRows.length}\nالمكرر: ${duplicateRows.length}`;
+
+  if (reply.length > 3500) {
+    const txtPath = path.join(process.cwd(), `result_${Date.now()}.txt`);
+    fs.writeFileSync(txtPath, reply, "utf8");
+    await sendDocument(chatId, txtPath, "نتيجة استخراج الأرقام");
+    fs.unlinkSync(txtPath);
+  } else {
+    await sendMessage(chatId, reply);
+  }
+}
+
+function getImageFileId(message) {
+  if (message.photo) {
+    return message.photo[message.photo.length - 1].file_id;
+  }
+
+  if (message.document && String(message.document.mime_type || "").startsWith("image/")) {
+    return message.document.file_id;
+  }
+
+  return "";
 }
 
 app.get("/", (req, res) => {
@@ -81,42 +158,59 @@ app.post("/webhook", async (req, res) => {
     const chatId = message.chat.id;
 
     if (message.text === "/start") {
-      await sendMessage(chatId, "ابعت صورة فيها QR والرقم تحتها، وأنا أطلع الرقم وأقولك لو مكرر.");
+      await sendMessage(chatId, "ابعت صورة واحدة أو مجموعة صور Album، وأنا أطلع الأرقام وأحط المكرر في الآخر.");
       return;
     }
 
-    if (!message.photo && !message.document) {
-      await sendMessage(chatId, "ابعت صورة فقط.");
+    if (message.text === "/export") {
+      const numbers = loadDB();
+      const txtPath = path.join(process.cwd(), "all_numbers.txt");
+      fs.writeFileSync(txtPath, numbers.join("\n"), "utf8");
+      await sendDocument(chatId, txtPath, "كل الأرقام المحفوظة");
+      fs.unlinkSync(txtPath);
       return;
     }
 
-    let fileId = "";
-
-    if (message.photo) {
-      fileId = message.photo[message.photo.length - 1].file_id;
-    } else if (message.document && String(message.document.mime_type || "").startsWith("image/")) {
-      fileId = message.document.file_id;
-    } else {
-      await sendMessage(chatId, "الملف مش صورة.");
+    if (message.text === "/clear") {
+      saveDB([]);
+      await sendMessage(chatId, "تم مسح سجل الأرقام القديمة.");
       return;
     }
 
-    const fileUrl = await getFileUrl(fileId);
-    const text = await ocrImageFromUrl(fileUrl);
-    const number = extractNumber(text);
+    const fileId = getImageFileId(message);
 
-    if (!number) {
-      await sendMessage(chatId, "مش قادر أقرأ الرقم من الصورة. جرّب صورة أوضح.");
+    if (!fileId) {
+      await sendMessage(chatId, "ابعت صورة فقط، أو استخدم /export للتصدير، أو /clear لمسح السجل.");
       return;
     }
 
-    const oldNumbers = loadDB();
-    const isDuplicate = oldNumbers.includes(number);
+    const groupId = message.media_group_id;
 
-    oldNumbers.push(number);
-    saveDB(oldNumbers);
+    if (groupId) {
+      const key = `${chatId}_${groupId}`;
 
-    await sendMessage(chatId, isDuplicate ? `${number} - مكرر` : number);
+      if (!albumBuffer.has(key)) {
+        albumBuffer.set(key, { chatId, fileIds: [], timer: null });
+      }
+
+      const item = albumBuffer.get(key);
+      item.fileIds.push(fileId);
+
+      if (item.timer) clearTimeout(item.timer);
+
+      item.timer = setTimeout(async () => {
+        const saved = albumBuffer.get(key);
+        albumBuffer.delete(key);
+
+        await sendMessage(saved.chatId, `استلمت ${saved.fileIds.length} صورة، جاري استخراج الأرقام...`);
+        await handleFileIds(saved.chatId, saved.fileIds);
+      }, 3500);
+
+      return;
+    }
+
+    await sendMessage(chatId, "جاري قراءة الصورة...");
+    await handleFileIds(chatId, [fileId]);
 
   } catch (err) {
     console.error("WEBHOOK ERROR:", err?.response?.data || err.message || err);
