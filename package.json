@@ -1,5 +1,5 @@
 {
-  "name": "whatsapp-qr-number-bot",
+  "name": "telegram-qr-number-bot",
   "version": "1.0.0",
   "type": "module",
   "scripts": {

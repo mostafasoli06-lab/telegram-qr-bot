@@ -6,12 +6,9 @@ import { createWorker } from "tesseract.js";
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
-const PORT = process.env.PORT || 3000;
-const INSTANCE = process.env.ULTRAMSG_INSTANCE || "instanceXXXX";
-const TOKEN = process.env.ULTRAMSG_TOKEN || "PUT_TOKEN_HERE";
-
+const PORT = process.env.PORT || 8080;
+const BOT_TOKEN = process.env.BOT_TOKEN;
 const DB_PATH = path.join(process.cwd(), "numbers.json");
 
 function loadDB() {
@@ -41,15 +38,19 @@ function extractNumber(text) {
   return "";
 }
 
-async function sendWhatsApp(to, body) {
-  const url = `https://api.ultramsg.com/${INSTANCE}/messages/chat`;
-  await axios.post(url, new URLSearchParams({
-    token: TOKEN,
-    to,
-    body
-  }).toString(), {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" }
-  });
+async function telegram(method, data) {
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/${method}`;
+  return axios.post(url, data);
+}
+
+async function sendMessage(chatId, text) {
+  await telegram("sendMessage", { chat_id: chatId, text });
+}
+
+async function getFileUrl(fileId) {
+  const res = await axios.get(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`);
+  const filePath = res.data.result.file_path;
+  return `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
 }
 
 async function ocrImageFromUrl(imageUrl) {
@@ -66,30 +67,46 @@ async function ocrImageFromUrl(imageUrl) {
 }
 
 app.get("/", (req, res) => {
-  res.send("WhatsApp QR Number Bot is running.");
+  res.send("Telegram QR Number Bot is running.");
 });
 
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
 
   try {
-    const data = req.body;
-    const from = data.from || data.author || data.chatId || data.to;
-    const type = data.type || data.message_type || "";
-    const mediaUrl = data.media || data.mediaUrl || data.body || data.url || "";
+    const update = req.body;
+    const message = update.message || update.edited_message;
+    if (!message) return;
 
-    if (!from) return;
+    const chatId = message.chat.id;
 
-    if (!mediaUrl || !String(mediaUrl).startsWith("http")) {
-      await sendWhatsApp(from, "ابعت صورة فيها QR والرقم تحتها.");
+    if (message.text === "/start") {
+      await sendMessage(chatId, "ابعت صورة فيها QR والرقم تحتها، وأنا أطلع الرقم وأقولك لو مكرر.");
       return;
     }
 
-    const text = await ocrImageFromUrl(mediaUrl);
+    if (!message.photo && !message.document) {
+      await sendMessage(chatId, "ابعت صورة فقط.");
+      return;
+    }
+
+    let fileId = "";
+
+    if (message.photo) {
+      fileId = message.photo[message.photo.length - 1].file_id;
+    } else if (message.document && String(message.document.mime_type || "").startsWith("image/")) {
+      fileId = message.document.file_id;
+    } else {
+      await sendMessage(chatId, "الملف مش صورة.");
+      return;
+    }
+
+    const fileUrl = await getFileUrl(fileId);
+    const text = await ocrImageFromUrl(fileUrl);
     const number = extractNumber(text);
 
     if (!number) {
-      await sendWhatsApp(from, "مش قادر أقرأ الرقم من الصورة. جرّب صورة أوضح.");
+      await sendMessage(chatId, "مش قادر أقرأ الرقم من الصورة. جرّب صورة أوضح.");
       return;
     }
 
@@ -99,11 +116,10 @@ app.post("/webhook", async (req, res) => {
     oldNumbers.push(number);
     saveDB(oldNumbers);
 
-    const reply = isDuplicate ? `${number} - مكرر` : `${number}`;
-    await sendWhatsApp(from, reply);
+    await sendMessage(chatId, isDuplicate ? `${number} - مكرر` : number);
 
   } catch (err) {
-    console.error(err);
+    console.error("WEBHOOK ERROR:", err?.response?.data || err.message || err);
   }
 });
 
